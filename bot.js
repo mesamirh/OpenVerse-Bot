@@ -8,21 +8,6 @@ const dotenv = require("dotenv");
 dotenv.config();
 wrapper(axios);
 
-const cookieJar = new CookieJar();
-const api = axios.create({
-  baseURL: "https://launch.openverse.network",
-  jar: cookieJar,
-  withCredentials: true,
-  headers: {
-    Accept: "application/json, text/plain, */*",
-    "Content-Type": "application/json",
-    Origin: "https://launch.openverse.network",
-    Referer: "https://launch.openverse.network/",
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-  },
-});
-
 const privateKeys = process.env.PRIVATE_KEYS
   ? process.env.PRIVATE_KEYS.split(",")
   : [];
@@ -30,48 +15,88 @@ const referralCode = process.env.REFERRAL_CODE || "TTK5I6LN";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function login(wallet) {
+const randomDelay = (min = 1000, max = 3000) => {
+  const ms = Math.floor(Math.random() * (max - min + 1)) + min;
+  return delay(ms);
+};
+
+function createApiInstance() {
+  const cookieJar = new CookieJar();
+  return axios.create({
+    baseURL: "https://launch.openverse.network",
+    jar: cookieJar,
+    withCredentials: true,
+    timeout: 30000,
+    headers: {
+      Accept: "application/json, text/plain, */*",
+      "Content-Type": "application/json",
+      Origin: "https://launch.openverse.network",
+      Referer: "https://launch.openverse.network/",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    },
+  });
+}
+
+async function login(wallet, api, retries = 3) {
   const address = wallet.address.toLowerCase();
   console.log(`[ℹ️] Wallet: ${chalk.yellow(address)}`);
-  try {
-    console.log(chalk.gray("  ├─ [🔒] Acquiring session token..."));
-    await api.get("/sanctum/csrf-cookie");
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log(chalk.gray("  ├─ [🔒] Acquiring session token..."));
+      await api.get("/sanctum/csrf-cookie");
 
-    const messageToSign = "Sign-in";
-    console.log(chalk.gray(`  ├─ [✍️] Signing message: "${messageToSign}"`));
-    const signature = await wallet.signMessage(messageToSign);
+      await randomDelay(500, 1500);
 
-    const payload = {
-      address,
-      referral_code: referralCode,
-      sign: signature,
-      kol_code: null,
-    };
-    const response = await api.post("/api/bindLogin", payload);
+      const messageToSign = "Sign-in";
+      console.log(chalk.gray(`  ├─ [✍️] Signing message: "${messageToSign}"`));
+      const signature = await wallet.signMessage(messageToSign);
 
-    if (response.data.res_code === 0 && response.data.data.access_token) {
-      console.log(chalk.green("  └─ [✅] Login successful!"));
-      return response.data.data.access_token;
-    } else {
-      console.log(
-        chalk.red(
-          `  └─ [❌] Login failed: ${response.data.res_msg || "Unknown error"}`
-        )
-      );
-      return null;
+      const payload = {
+        address,
+        referral_code: referralCode,
+        sign: signature,
+        kol_code: null,
+      };
+
+      await randomDelay(500, 1500);
+      const response = await api.post("/api/bindLogin", payload);
+
+      if (response.data.res_code === 0 && response.data.data.access_token) {
+        console.log(chalk.green("  └─ [✅] Login successful!"));
+        return response.data.data.access_token;
+      } else {
+        throw new Error(response.data.res_msg || "Unknown error");
+      }
+    } catch (error) {
+      const errorMessage = error.response
+        ? error.response.status === 404
+          ? "Server returned 404 - possibly rate limited"
+          : JSON.stringify(error.response.data)
+        : error.message;
+
+      if (attempt < retries) {
+        console.log(
+          chalk.yellow(`  ├─ [⚠️] Attempt ${attempt} failed: ${errorMessage}`)
+        );
+        console.log(
+          chalk.yellow(`  ├─ [🔄] Retrying in ${attempt * 5} seconds...`)
+        );
+        await delay(attempt * 5000);
+      } else {
+        console.log(
+          chalk.red(`  └─ [❌] All ${retries} attempts failed: ${errorMessage}`)
+        );
+        return null;
+      }
     }
-  } catch (error) {
-    const errorMessage = error.response
-      ? JSON.stringify(error.response.data)
-      : error.message;
-    console.log(chalk.red(`  └─ [❌] Exception during login: ${errorMessage}`));
-    return null;
   }
 }
 
 async function performTask(taskName, apiCall) {
   process.stdout.write(chalk.blue(`  │ [➡️]  ${taskName}... `));
   try {
+    await randomDelay(500, 1500);
     const response = await apiCall();
     if (response.data.res_code === 0) {
       let details = "Success!";
@@ -94,7 +119,7 @@ async function performTask(taskName, apiCall) {
   }
 }
 
-async function getUserInfo(token, context = "Status") {
+async function getUserInfo(token, api, context = "Status") {
   try {
     const response = await api.get("/api/user", {
       headers: { Authorization: `Bearer ${token}` },
@@ -154,11 +179,13 @@ async function main() {
     );
     console.log(chalk.gray(`- - - - - - - - - - - - - - - - - - - - - -`));
 
+    const api = createApiInstance();
+
     const wallet = new Wallet(pk.startsWith("0x") ? pk : "0x" + pk);
-    const accessToken = await login(wallet);
+    const accessToken = await login(wallet, api);
 
     if (accessToken) {
-      await getUserInfo(accessToken, "Initial Status");
+      await getUserInfo(accessToken, api, "Initial Status");
 
       console.log(chalk.cyan(`  │`));
       console.log(chalk.cyan(`  ┌─ [⚙️ Actions]`));
@@ -170,7 +197,8 @@ async function main() {
           { headers: { Authorization: `Bearer ${accessToken}` } }
         )
       );
-      await delay(1000);
+
+      await randomDelay(2000, 4000);
 
       await performTask("Claiming tBTG", () =>
         api.post(
@@ -181,9 +209,9 @@ async function main() {
       );
 
       console.log(chalk.cyan(`  └──────────────────────────`));
-      await delay(1000);
+      await randomDelay(1000, 2000);
 
-      await getUserInfo(accessToken, "Final Status");
+      await getUserInfo(accessToken, api, "Final Status");
     } else {
       console.error(
         chalk.red.bold(`\n[❌ FAIL] Could not process account ${index + 1}.`)
@@ -191,7 +219,11 @@ async function main() {
     }
 
     if (index < privateKeys.length - 1) {
-      await delay(5000);
+      const delayTime = Math.floor(Math.random() * 10000) + 10000;
+      console.log(
+        chalk.gray(`\n[⏳] Waiting ${delayTime / 1000}s before next account...`)
+      );
+      await delay(delayTime);
     }
   }
 
